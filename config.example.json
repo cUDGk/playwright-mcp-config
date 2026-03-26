@@ -1,0 +1,10 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "channel": null,
+      "executablePath": "/path/to/brave-browser",
+      "headless": false
+    }
+  }
+}
