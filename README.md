@@ -1,9 +1,19 @@
+<div align="center">
+
+# Playwright MCP - Brave Browser カスタム設定
+
+### Playwright MCP × Brave
+
 [![Playwright](https://img.shields.io/badge/Playwright-MCP-2EAD33?style=for-the-badge&logo=playwright&logoColor=white)](https://github.com/microsoft/playwright-mcp)
 [![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-8B5CF6?style=for-the-badge)](https://modelcontextprotocol.io/)
 [![Brave](https://img.shields.io/badge/Brave-Browser-FB542B?style=for-the-badge&logo=brave&logoColor=white)](https://brave.com/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-# Playwright MCP - Brave Browser カスタム設定
+**Playwright MCP で Brave ブラウザを使うためのカスタム設定**
+
+---
+
+</div>
 
 ## 概要
 
