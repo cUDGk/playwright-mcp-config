@@ -89,6 +89,29 @@ Claude Code の設定ファイル（`.claude/settings.json` 等）に以下を�
 |---|---|
 | `config.json` | Brave用の設定ファイル（Windowsパス） |
 | `config.example.json` | テンプレート（パスはプレースホルダー） |
+| `launch.mjs` | 複数同時起動ランチャ（下記） |
+| `sync-extensions.ps1` | `extensions/` 直下の拡張を `config.json` に反映（`launch.mjs` 使用時は不要） |
+
+## 複数同時起動（launch.mjs）
+
+MCP サーバーのコマンドを `npx @playwright/mcp ...` の代わりに `node launch.mjs` にすると、
+セッションごとに空きプロファイルスロットを自動確保して別々の Brave を起動できます。
+
+- スロット 1 = `brave-claude-profile`（従来のプロファイル）、2〜3 = そのクローン、4〜6 = 空プロファイル（予備）
+- 確保は `locks/slot-N.lock`（PID 入り）によるロック。プロセスが死んでいれば自動で奪還
+- セッション終了時にそのスロットの Brave を閉じ、ロックを解放
+- 拡張機能は `extensions/` 直下の `manifest.json` 持ちフォルダを起動のたびに自動列挙（`sync-extensions.ps1` の実行は不要）
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "node",
+      "args": ["C:/path/to/playwright-mcp-config/launch.mjs"]
+    }
+  }
+}
+```
 
 ## バージョン固定について
 
