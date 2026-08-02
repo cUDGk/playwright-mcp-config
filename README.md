@@ -89,18 +89,45 @@ Claude Code の設定ファイル（`.claude/settings.json` 等）に以下を�
 |---|---|
 | `config.json` | Brave用の設定ファイル（Windowsパス） |
 | `config.example.json` | テンプレート（パスはプレースホルダー） |
-| `launch.mjs` | 複数同時起動ランチャ（下記） |
+| `brave-daemon.mjs` | 共有 Brave を1つだけ常駐させる（下記） |
+| `launch.mjs` | 共有 Brave に CDP 接続して MCP を起動するランチャ（下記） |
 | `sync-extensions.ps1` | `extensions/` 直下の拡張を `config.json` に反映（`launch.mjs` 使用時は不要） |
 
-## 複数同時起動（launch.mjs）
+## 共有 Brave 方式（launch.mjs / brave-daemon.mjs）
 
 MCP サーバーのコマンドを `npx @playwright/mcp ...` の代わりに `node launch.mjs` にすると、
-セッションごとに空きプロファイルスロットを自動確保して別々の Brave を起動できます。
+**全セッションが同じ Brave を共有**します。Chromium は同じ `user-data-dir` を2プロセスで
+開けないため、「セッションごとに Brave を起動する」方式ではログイン状態を共有できず、
+同時数もプロファイル数で頭打ちになります。そこで Brave を1つだけ立ててデバッグポートを開き、
+各 MCP は CDP でぶら下がります。
 
-- スロット 1 = `brave-claude-profile`（従来のプロファイル）、2〜3 = そのクローン、4〜6 = 空プロファイル（予備）
-- 確保は `locks/slot-N.lock`（PID 入り）によるロック。プロセスが死んでいれば自動で奪還
-- セッション終了時にそのスロットの Brave を閉じ、ロックを解放
-- 拡張機能は `extensions/` 直下の `manifest.json` 持ちフォルダを起動のたびに自動列挙（`sync-extensions.ps1` の実行は不要）
+- `brave-daemon.mjs` が `brave-claude-profile` の Brave を `--remote-debugging-port=9222` で常駐させる
+  （既に生きていれば何もしない。ポート番号は `BRAVE_CDP_PORT` で変更可）
+- `launch.mjs` は `browser.cdpEndpoint` を書いた設定で `@playwright/mcp` を起動する
+- セッション数の上限は無く、ログイン状態・Cookie は全セッションで共通
+- MCP 終了時も Brave は落とさない（他セッションが使っているため）
+- 拡張機能は `extensions/` 直下の `manifest.json` 持ちフォルダを常駐 Brave の起動時に自動列挙
+  （`sync-extensions.ps1` の実行は不要）
+
+`brave-daemon.mjs` は単体でも実行でき、CDP エンドポイントを標準出力に出します。
+Playwright MCP 以外のブラウザ操作 MCP も、この `http://127.0.0.1:9222` にアタッチすれば
+同じログイン済みプロファイルを共有できます。
+
+```bash
+node brave-daemon.mjs   # -> http://127.0.0.1:9222
+```
+
+### 1つのブラウザを共有する副作用への対処
+
+`launch.mjs` は素通しではなく stdio を中継し、次の2つを行います。
+
+- **セッション専用タブの確保**: Playwright MCP は接続時に「既存ページのうち最古のもの」を
+  カレントタブにするため、放置すると全セッションが同じタブを掴んで遷移を潰し合う。
+  初期化直後に `browser_tabs:new` を1度だけ注入し、終了時にそのタブを閉じる。
+- **ツール呼び出しの直列化**: Playwright MCP は応答を組み立てるたびにコンテキスト内の
+  全タブの `page.title()` を呼ぶ。他セッションが遷移中のタブに当たると
+  `Execution context was destroyed` で無関係な呼び出しごと失敗するため、
+  `locks/browser.lock` によりブラウザに触る呼び出しを全セッションで1つずつ通す。
 
 ```json
 {

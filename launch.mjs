@@ -1,122 +1,156 @@
 #!/usr/bin/env node
-// Playwright MCP を「空いている Brave プロファイルスロット」で起動するランチャ。
-// 各 Claude セッションが自分専用の Brave を立ち上げ、セッション終了時に閉じてスロットを返す。
-// スロット1 = brave-claude-profile(従来)、2〜3 = ログイン済みクローン、4〜6 = 空プロファイル(予備)。
+// Playwright MCP を「共有Brave」に CDP 接続した状態で起動するランチャ。
+//
+// 旧方式はセッションごとに専用プロファイルの Brave を立てていた (スロット式)。
+// その結果プロファイルが共有されず、同時起動数もスロット数 (6) で頭打ちだった。
+// 現方式は brave-daemon.mjs が立てる Brave 1つに全セッションがぶら下がるので、
+// ログイン状態は常に共通で、セッション数の上限も無い。
+//
+// 代わりに1つのブラウザを共有する副作用が出るため、このランチャが stdio を中継して
+//   1. 起動直後に自分専用タブを確保する (他セッションと同じタブを掴まない)
+//   2. tools/call をプロセス跨ぎで直列化する (下記 cross-talk 対策)
+//   3. 終了時に自分のタブを畳む (共有ブラウザにタブを残さない)
+// を行う。
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { ensureBrave, pidAlive, CDP_ENDPOINT } from './brave-daemon.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const MAX_SLOTS = 6;
-const LOCK_DIR = path.join(ROOT, 'locks');
-const CFG_DIR = path.join(ROOT, 'configs');
+const LOCK = path.join(ROOT, 'locks', 'browser.lock');
+const MAX_HOLD_MS = 120000;   // 掴んだまま固まったセッションからロックを奪うまでの時間
 
-fs.mkdirSync(LOCK_DIR, { recursive: true });
-fs.mkdirSync(CFG_DIR, { recursive: true });
+await ensureBrave();
+console.error(`playwright-brave: shared Brave at ${CDP_ENDPOINT}`);
 
-const slotDir = (n) =>
-  path.join(ROOT, n === 1 ? 'brave-claude-profile' : `brave-claude-profile-${n}`);
+// cdpEndpoint 指定時は userDataDir / launchOptions は無視されるので書かない
+const cfgPath = path.join(ROOT, 'configs', 'cdp.json');
+fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+fs.writeFileSync(cfgPath, JSON.stringify({
+  browser: { browserName: 'chromium', cdpEndpoint: CDP_ENDPOINT },
+}, null, 2));
 
-function pidAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
+// Node は .cmd 直 spawn を拒否する (CVE-2024-27980) ため shell 経由。パスに空白は無い前提。
+const child = spawn(`npx @playwright/mcp@0.0.68 --config ${cfgPath}`,
+  { stdio: ['pipe', 'pipe', 'inherit'], shell: true, windowsHide: true });
 
-// openSync('wx') がアトミックなので同時起動でも1プロセスしか取れない。
-// 中身の PID が死んでいたら残骸ロックとみなして奪い、読み返しで競合負けを検出する。
-function tryLock(n) {
-  const file = path.join(LOCK_DIR, `slot-${n}.lock`);
+// ---- tools/call の直列化 ----
+// Playwright MCP は応答を組み立てる度に「コンテキスト内の全タブ」の page.title() を
+// 呼ぶ (playwright-core lib/tools/backend/tab.js の headerSnapshot)。共有ブラウザでは
+// 他セッションが遷移中のタブもここに含まれ、"Execution context was destroyed" で
+// 無関係なセッションのツール呼び出しが丸ごと失敗する。上流を直せないので、
+// ブラウザに触る呼び出し自体を全セッションで1つずつ通す。
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function tryLock() {
+  fs.mkdirSync(path.dirname(LOCK), { recursive: true });
   try {
-    const fd = fs.openSync(file, 'wx');
-    fs.writeSync(fd, String(process.pid));
+    const fd = fs.openSync(LOCK, 'wx');
+    fs.writeSync(fd, `${process.pid} ${Date.now()}`);
     fs.closeSync(fd);
-    return file;
+    return true;
   } catch {
-    let pid = NaN;
-    try { pid = parseInt(fs.readFileSync(file, 'utf8'), 10); } catch {}
-    if (Number.isFinite(pid) && pidAlive(pid)) return null;
-    try { fs.writeFileSync(file, String(process.pid)); } catch { return null; }
+    // 保持者が死んだ / 掴みっぱなしなら奪う。読み返して競合負けを検出する。
+    let pid = NaN, at = 0;
+    try { [pid, at] = fs.readFileSync(LOCK, 'utf8').split(' ').map(Number); } catch {}
+    const holderAlive = Number.isFinite(pid) && pidAlive(pid);
+    if (holderAlive && Date.now() - at < MAX_HOLD_MS) return false;
     try {
-      if (fs.readFileSync(file, 'utf8') !== String(process.pid)) return null;
-    } catch { return null; }
-    return file;
+      fs.writeFileSync(LOCK, `${process.pid} ${Date.now()}`);
+      return fs.readFileSync(LOCK, 'utf8').startsWith(`${process.pid} `);
+    } catch { return false; }
   }
 }
 
-const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-// このスロットのプロファイルを掴んでいる brave を全部終了させる。
-// "profile" が "profile-2" に前方一致マッチしないよう、パス直後は引用符/空白/終端のみ許可。
-function killBrave(dir) {
+function unlock() {
   try {
-    const out = execFileSync('powershell.exe',
-      ['-NoProfile', '-Command',
-       'Get-CimInstance Win32_Process -Filter "Name=\'brave.exe\'" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress'],
-      { encoding: 'utf8', windowsHide: true });
-    if (!out.trim()) return;
-    let procs = JSON.parse(out);
-    if (!Array.isArray(procs)) procs = [procs];
-    const re = new RegExp(escapeRe(dir) + '($|["\\s])', 'i');
-    for (const p of procs) {
-      if (p.CommandLine && re.test(p.CommandLine)) {
-        try { process.kill(p.ProcessId); } catch {}
-      }
-    }
+    if (fs.readFileSync(LOCK, 'utf8').startsWith(`${process.pid} `)) fs.unlinkSync(LOCK);
   } catch {}
 }
 
-// ---- スロット確保 ----
-let lockFile = null;
-let slot = 0;
-for (let n = 1; n <= MAX_SLOTS && !lockFile; n++) {
-  const f = tryLock(n);
-  if (f) { lockFile = f; slot = n; }
-}
-if (!lockFile) {
-  console.error(`playwright-brave: 空きスロットなし (最大 ${MAX_SLOTS} 同時起動)`);
-  process.exit(1);
-}
+let inflight = null;                 // 応答待ちの {id, done}
+let chain = Promise.resolve();       // 自セッション内の順序も保つ
 
-const profileDir = slotDir(slot);
-killBrave(profileDir);                          // 前セッションの残骸を掃除
-fs.mkdirSync(profileDir, { recursive: true });  // slot4以降は空プロファイルで開始
-console.error(`playwright-brave: slot ${slot} (${path.basename(profileDir)})`);
-
-// ---- config 生成: config.json を雛形に userDataDir と拡張だけ差し替え ----
-// 拡張は extensions/ 直下の manifest.json 持ちサブフォルダを毎回列挙(sync-extensions.ps1 と同じ規則)
-const template = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
-const extRoot = path.join(ROOT, 'extensions');
-const exts = fs.existsSync(extRoot)
-  ? fs.readdirSync(extRoot, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && fs.existsSync(path.join(extRoot, d.name, 'manifest.json')))
-      .map((d) => path.join(extRoot, d.name))
-  : [];
-const cfg = structuredClone(template);
-cfg.browser.userDataDir = profileDir;
-cfg.browser.launchOptions.ignoreDefaultArgs = ['--disable-extensions'];
-if (exts.length) cfg.browser.launchOptions.args = ['--load-extension=' + exts.join(',')];
-else delete cfg.browser.launchOptions.args;
-const cfgPath = path.join(CFG_DIR, `slot-${slot}.json`);
-fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
-
-// ---- MCP 本体を起動 ----
-// Node は .cmd 直 spawn を拒否する (CVE-2024-27980) ため shell 経由。パスに空白は無い前提。
-const child = spawn(`npx @playwright/mcp@0.0.68 --config ${cfgPath}`,
-  { stdio: 'inherit', shell: true, windowsHide: true });
-
-let done = false;
-function cleanup() {
-  if (done) return;
-  done = true;
-  killBrave(profileDir);
-  try { fs.unlinkSync(lockFile); } catch {}
+function forwardSerialized(line, id) {
+  chain = chain.then(async () => {
+    while (!tryLock()) await sleep(80);
+    await new Promise((done) => {
+      inflight = { id, done };
+      child.stdin.write(line);
+      // 応答が来ないまま固まっても、MAX_HOLD 経過で他セッションが奪えるので全体は止まらない
+      setTimeout(() => { if (inflight?.id === id) settle(id); }, MAX_HOLD_MS);
+    });
+  });
 }
 
-child.on('exit', (code) => {
-  // MCP が自分で閉じる猶予を少し与えてから残骸を掃除
-  setTimeout(() => { cleanup(); process.exit(code ?? 0); }, 1500);
-});
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.on(sig, () => { try { child.kill(); } catch {} cleanup(); process.exit(0); });
+function settle(id) {
+  if (!inflight || inflight.id !== id) return;
+  const { done } = inflight;
+  inflight = null;
+  unlock();
+  done();
 }
-process.on('exit', cleanup);
+
+// ---- 自分専用タブの確保 ----
+// Playwright MCP は接続時に「既存ページのうち最古のもの」を current tab にするため、
+// 何もしないと全セッションが同じタブを掴んで goto を潰し合う (ERR_ABORTED)。
+// context.newTab() は current tab を新規ページに差し替えるので、初回に1度だけ注入する。
+const NEW_TAB_ID = 'launcher-newtab';
+const CLOSE_TAB_ID = 'launcher-closetab';
+const rpc = (id, name, args) =>
+  JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n';
+
+// MCP stdio は改行区切り JSON。行はそのまま素通しし、中身は覗くだけ。
+function lineFilter(onLine) {
+  let buf = '';
+  return (chunk) => {
+    buf += chunk.toString();
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      onLine(buf.slice(0, i + 1));
+      buf = buf.slice(i + 1);
+    }
+  };
+}
+
+const parse = (line) => { try { return JSON.parse(line); } catch { return null; } };
+
+process.stdin.on('data', lineFilter((line) => {
+  const msg = parse(line);
+  if (msg?.method === 'tools/call' && msg.id !== undefined) {
+    forwardSerialized(line, msg.id);          // ブラウザに触る呼び出しだけロック下で通す
+    return;
+  }
+  child.stdin.write(line);
+  if (msg?.method === 'notifications/initialized') forwardSerialized(rpc(NEW_TAB_ID, 'browser_tabs', { action: 'new' }), NEW_TAB_ID);
+}));
+process.stdin.on('end', () => shutdown(0));
+
+child.stdout.on('data', lineFilter((line) => {
+  const msg = parse(line);
+  if (msg && msg.id !== undefined) settle(msg.id);
+  if (msg && (msg.id === NEW_TAB_ID || msg.id === CLOSE_TAB_ID)) {
+    if (msg.error) console.error(`playwright-brave: ${msg.id} 失敗 ${JSON.stringify(msg.error)}`);
+    return;                                   // 注入したリクエストの応答はクライアントに見せない
+  }
+  process.stdout.write(line);
+}));
+
+// ---- 終了処理 ----
+// Brave は落とさない (他セッションと共有)。代わりに自分のタブだけ畳んで抜ける。
+let closing = false;
+function shutdown(code) {
+  if (closing) return;
+  closing = true;
+  try { child.stdin.write(rpc(CLOSE_TAB_ID, 'browser_tabs', { action: 'close' })); } catch {}
+  setTimeout(() => {
+    try { child.kill(); } catch {}
+    unlock();
+    process.exit(code);
+  }, 1500);
+}
+
+child.on('exit', (code) => { unlock(); process.exit(code ?? 0); });
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => shutdown(0));
+process.on('exit', unlock);
