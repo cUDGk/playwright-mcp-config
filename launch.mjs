@@ -7,7 +7,8 @@
 // ログイン状態は常に共通で、セッション数の上限も無い。
 //
 // 代わりに1つのブラウザを共有する副作用が出るため、このランチャが stdio を中継して
-//   1. 起動直後に自分専用タブを確保する (他セッションと同じタブを掴まない)
+//   1. 最初の tools/call の直前に Brave を確保し、自分専用タブを開く
+//      (Claude Code 起動だけではブラウザを立てない・他セッションと同じタブを掴まない)
 //   2. tools/call をプロセス跨ぎで直列化する (下記 cross-talk 対策)
 //   3. 終了時に自分のタブを畳む (共有ブラウザにタブを残さない)
 // を行う。
@@ -21,8 +22,13 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const LOCK = path.join(ROOT, 'locks', 'browser.lock');
 const MAX_HOLD_MS = 120000;   // 掴んだまま固まったセッションからロックを奪うまでの時間
 
-await ensureBrave();
-console.error(`playwright-brave: shared Brave at ${CDP_ENDPOINT}`);
+// Brave はここでは立てない。最初のブラウザ操作 (tools/call) が来た時に ensureBrave() する。
+// 失敗時は null に戻して次の呼び出しで再試行する。
+let bravePromise = null;
+const braveUp = () => (bravePromise ??= ensureBrave().then(
+  () => console.error(`playwright-brave: shared Brave at ${CDP_ENDPOINT}`),
+  (e) => { bravePromise = null; throw e; },
+));
 
 // cdpEndpoint 指定時は userDataDir / launchOptions は無視されるので書かない
 const cfgPath = path.join(ROOT, 'configs', 'cdp.json');
@@ -74,6 +80,9 @@ let chain = Promise.resolve();       // 自セッション内の順序も保つ
 
 function forwardSerialized(line, id) {
   chain = chain.then(async () => {
+    // Brave が立っていなければここで立てる。失敗しても呼び出しは素通しし、
+    // Playwright MCP 側の CDP 接続エラーをそのままクライアントに返させる。
+    try { await braveUp(); } catch (e) { console.error(`playwright-brave: Brave 起動失敗 ${e}`); }
     while (!tryLock()) await sleep(80);
     await new Promise((done) => {
       inflight = { id, done };
@@ -95,7 +104,8 @@ function settle(id) {
 // ---- 自分専用タブの確保 ----
 // Playwright MCP は接続時に「既存ページのうち最古のもの」を current tab にするため、
 // 何もしないと全セッションが同じタブを掴んで goto を潰し合う (ERR_ABORTED)。
-// context.newTab() は current tab を新規ページに差し替えるので、初回に1度だけ注入する。
+// context.newTab() は current tab を新規ページに差し替えるので、最初の tools/call の
+// 直前に1度だけ注入する (initialized 時に注入すると Brave 起動を早めてしまう)。
 const NEW_TAB_ID = 'launcher-newtab';
 const CLOSE_TAB_ID = 'launcher-closetab';
 const rpc = (id, name, args) =>
@@ -116,14 +126,19 @@ function lineFilter(onLine) {
 
 const parse = (line) => { try { return JSON.parse(line); } catch { return null; } };
 
+let tabAcquired = false;
+
 process.stdin.on('data', lineFilter((line) => {
   const msg = parse(line);
   if (msg?.method === 'tools/call' && msg.id !== undefined) {
+    if (!tabAcquired) {
+      tabAcquired = true;
+      forwardSerialized(rpc(NEW_TAB_ID, 'browser_tabs', { action: 'new' }), NEW_TAB_ID);
+    }
     forwardSerialized(line, msg.id);          // ブラウザに触る呼び出しだけロック下で通す
     return;
   }
   child.stdin.write(line);
-  if (msg?.method === 'notifications/initialized') forwardSerialized(rpc(NEW_TAB_ID, 'browser_tabs', { action: 'new' }), NEW_TAB_ID);
 }));
 process.stdin.on('end', () => shutdown(0));
 
@@ -143,6 +158,11 @@ let closing = false;
 function shutdown(code) {
   if (closing) return;
   closing = true;
+  if (!tabAcquired) {                         // ブラウザ未使用なら畳むタブも無いので即終了
+    try { child.kill(); } catch {}
+    unlock();
+    process.exit(code);
+  }
   try { child.stdin.write(rpc(CLOSE_TAB_ID, 'browser_tabs', { action: 'close' })); } catch {}
   setTimeout(() => {
     try { child.kill(); } catch {}
